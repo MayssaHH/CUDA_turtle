@@ -36,7 +36,7 @@ int main(int argc, char* argv[]) {
 
     CUDA_ERROR_CHECK(cudaDeviceSynchronize());
     setbuf(stdout, NULL);
-    const char* dataset = "data/rajat18.txt";
+    const char* dataset = "data/tiny_ltri.txt";
     unsigned int runCPUVersion = 1;
     unsigned int runGPUVersion[4] = { 0 };
     unsigned int useGPU = 0;
