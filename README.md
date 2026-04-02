@@ -34,11 +34,6 @@ Shipped examples:
 
 The CLI also supports `-d s`, `-d m`, `-d l` for other named datasets (`rajat18`, `parabolic_fem`, `tmt_sym`); those files are **not** included here and must be placed under `data/` if you use those flags.
 
-## Requirements
-
-- **NVIDIA CUDA Toolkit** (`nvcc` on `PATH`)
-- A **CUDA-capable GPU** only if you enable GPU flags (`-0` … `-3`); with stubs, GPU runs complete quickly but do **not** compute a real solve
-
 ## How to run
 
 Clone the repository and enter the project directory:
