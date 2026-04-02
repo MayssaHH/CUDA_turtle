@@ -20,15 +20,20 @@ static void stopTime(Timer* timer) {
     gettimeofday(&(timer->endTime), NULL);
 }
 
+static float timerElapsedMs(const Timer* timer) {
+    return ((float)(timer->endTime.tv_sec - timer->startTime.tv_sec)
+            + (float)(timer->endTime.tv_usec - timer->startTime.tv_usec) / 1.0e6f)
+           * 1e3f;
+}
+
 static void printElapsedTime(Timer timer, const char* s, enum PrintColor color = NONE) {
-    float t = ((float) ((timer.endTime.tv_sec - timer.startTime.tv_sec) \
-                + (timer.endTime.tv_usec - timer.startTime.tv_usec)/1.0e6));
+    float tms = timerElapsedMs(&timer);
     switch(color) {
         case GREEN:  printf("\033[1;32m"); break;
         case DGREEN: printf("\033[0;32m"); break;
         case CYAN :  printf("\033[1;36m"); break;
     }
-    printf("%s: %f ms\n", s, t*1e3);
+    printf("%s: %f ms\n", s, tms);
     if(color != NONE) {
         printf("\033[0m");
     }

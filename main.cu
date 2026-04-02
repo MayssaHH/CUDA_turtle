@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <unistd.h>
 
@@ -40,9 +41,10 @@ int main(int argc, char* argv[]) {
     unsigned int runCPUVersion = 1;
     unsigned int runGPUVersion[4] = { 0 };
     unsigned int useGPU = 0;
+    unsigned int profileMode = 0;
     int opt;
     // Parse arguments
-    while ((opt = getopt(argc, argv, "d:s0123")) >= 0) {
+    while ((opt = getopt(argc, argv, "d:ps0123")) >= 0) {
         switch (opt) {
             case 'd':
                 if (strcmp(optarg, "s") == 0) {
@@ -55,6 +57,10 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "Invalid dataset size. Use -d s, -d m, or -d l\n");
                     exit(1);
                 }
+                break;
+
+            case 'p':
+                profileMode = 1;
                 break;
 
             case 's':
@@ -82,6 +88,37 @@ int main(int argc, char* argv[]) {
                 exit(1);
         }
     }
+
+    if (profileMode) {
+        const unsigned int nB = 128;
+        static const unsigned int ns[] = {32,  48,  64,  80,  96,  112, 128, 160,
+                                          192, 224, 256, 320, 384, 448, 512};
+        const unsigned int numN = sizeof(ns) / sizeof(ns[0]);
+        fprintf(stderr,
+                "# CPU profile: dense lower-tri L (in-memory, same pattern as hard_ltri); "
+                "nB=%u; timed call is sptrsv_cpu only.\n",
+                nB);
+        printf("n,cpu_time_ms\n");
+        Timer timer;
+        for (unsigned int k = 0; k < numN; k++) {
+            unsigned int n = ns[k];
+            CSCMatrix* csc = createDenseLowerTriangleCSC(n);
+            CSRMatrix* csr = createCSRMatrixFromCSCMatrix(csc);
+            DenseMatrix* B = generateDenseMatrix(n, nB);
+            DenseMatrix* X = createEmptyDenseMatrix(n, nB);
+            sptrsv_cpu(csr, B, X);
+            startTime(&timer);
+            sptrsv_cpu(csr, B, X);
+            stopTime(&timer);
+            printf("%u,%.6f\n", n, timerElapsedMs(&timer));
+            freeDenseMatrix(B);
+            freeDenseMatrix(X);
+            freeCSRMatrix(csr);
+            freeCSCMatrix(csc);
+        }
+        return 0;
+    }
+
     // Allocate memory and intilalize data
     CSCMatrix* csc_h = createCSCMatrixFromFile(dataset);
     CSRMatrix* csr_h = createCSRMatrixFromCSCMatrix(csc_h);

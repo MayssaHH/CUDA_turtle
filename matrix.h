@@ -13,6 +13,7 @@ struct CSCMatrix {
 
 
 CSCMatrix* createCSCMatrixFromFile(const char* fileName);
+CSCMatrix* createDenseLowerTriangleCSC(unsigned int n);
 void copyCSCMatrixToGPU(CSCMatrix* cscMatrix_h, CSCMatrix* cscMatrix_d);
 CSCMatrix* createEmptyCSCMatrixOnGPU(unsigned int numCols, unsigned int numNonzeros); 
 void freeCSCMatrix(CSCMatrix* cscMatrix);

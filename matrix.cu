@@ -168,6 +168,51 @@ CSCMatrix* createCSCMatrixFromFile(const char* fileName){
     return mat;
 }
 
+CSCMatrix* createDenseLowerTriangleCSC(unsigned int n) {
+    unsigned int nnz = n * (n + 1u) / 2u;
+    CSCMatrix* mat = (CSCMatrix*)std::malloc(sizeof(CSCMatrix));
+    if (!mat) {
+        return nullptr;
+    }
+    mat->numRows = n;
+    mat->numCols = n;
+    mat->numNonzeros = nnz;
+    mat->colPtrs = (unsigned int*)std::calloc(n + 1u, sizeof(unsigned int));
+    mat->rowIdxs = (unsigned int*)std::malloc(sizeof(unsigned int) * nnz);
+    mat->colIdxs = (unsigned int*)std::malloc(sizeof(unsigned int) * nnz);
+    mat->values = (float*)std::malloc(sizeof(float) * nnz);
+    if (!mat->colPtrs || !mat->rowIdxs || !mat->colIdxs || !mat->values) {
+        std::free(mat->colPtrs);
+        std::free(mat->rowIdxs);
+        std::free(mat->colIdxs);
+        std::free(mat->values);
+        std::free(mat);
+        return nullptr;
+    }
+
+    unsigned int idx = 0;
+    for (unsigned int j = 0; j < n; j++) {
+        mat->colPtrs[j] = idx;
+        for (unsigned int i = j; i < n; i++) {
+            float v;
+            if (i == j) {
+                v = 8.0f + (float)(i % 13u) * 0.25f;
+            } else {
+                float base = 0.15f / (1.0f + (float)(i - j));
+                int mix = (int)((i + 7u * j) % 11u) - 5;
+                v = base * (float)mix * 0.2f;
+            }
+            mat->rowIdxs[idx] = i;
+            mat->colIdxs[idx] = j;
+            mat->values[idx] = v;
+            idx++;
+        }
+    }
+    mat->colPtrs[n] = idx;
+    assert(idx == nnz);
+    return mat;
+}
+
 DenseMatrix* generateDenseMatrix(unsigned int numRows, unsigned int numCols){
     DenseMatrix* mat = (DenseMatrix*)malloc(sizeof(DenseMatrix));
     mat->numRows = numRows;
