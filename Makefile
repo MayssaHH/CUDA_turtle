@@ -1,7 +1,8 @@
 
 NVCC        = nvcc
 NVCC_FLAGS  = -O3
-OBJ         = main.o matrix.o kernelCPU0.o kernel0.o kernel1.o kernel2.o kernel3.o
+# Temporary: real GPU objects are kernel0.o … kernel3.o when those .cu files exist.
+OBJ         = main.o matrix.o kernelCPU0.o kernel_stubs.o
 EXE         = sptrsv
 
 
