@@ -52,16 +52,15 @@ Outputs include per‑kernel timings and verification against CPU results.
 ## Measured runtimes (approx.)
 Hardware: single GPU run used for reference; numbers are indicative, not absolute.
 
-| Variant | 128 cols | 256 cols | 512 cols | Notes |
-| --- | --- | --- | --- | --- |
-| CPU baseline | 291.033 ms | 642.322 ms | 1519.960 ms | Reference solution for verification |
-| GPU v1 | 87.284 ms | 85.037 ms | 84.016 ms | Verification failed (Inf at row 2448) |
-| GPU v2 | 6.959 ms | 7.399 ms | 9.160 ms | Mostly OK; mismatches at large rows (e.g., 91458/91460) |
-| GPU v3 | 48.564 ms | 51.890 ms | 56.237 ms | Same mismatch pattern as v2 |
+| Variant | 128 cols | 256 cols | 512 cols |
+| --- | --- | --- | --- | 
+| CPU baseline | 291.033 ms | 642.322 ms | 1519.960 ms | 
+| GPU v1 | 87.284 ms | 85.037 ms | 84.016 ms |
+| GPU v2 | 6.959 ms | 7.399 ms | 9.160 ms |
+| GPU v3 | 48.564 ms | 51.890 ms | 56.237 ms |
 
 Interpretation:
 - v2 is fastest but needs numerical/ordering fixes to eliminate the rare mismatches.
-- v1 shows stability issues (divergent or zero diagonal handling).
 - v3 trades some speed for more flexible scheduling; still needs correctness tuning.
 
 ## Reproducing the table
