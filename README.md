@@ -49,20 +49,43 @@ Examples:
 
 Outputs include per‑kernel timings and verification against CPU results.
 
-## Measured runtimes (approx.)
-Hardware: single GPU run used for reference; numbers are indicative, not absolute.
+## CPU Runtime (ms)
 
-| Variant | 128 cols | 256 cols | 512 cols |
-| --- | --- | --- | --- | 
-| CPU baseline | 291.033 ms | 642.322 ms | 1519.960 ms | 
-| GPU v1 | 87.284 ms | 85.037 ms | 84.016 ms |
-| GPU v2 | 6.959 ms | 7.399 ms | 9.160 ms |
-| GPU v3 | 48.564 ms | 51.890 ms | 56.237 ms |
+| Data Set Size | Small  | Medium  | Large   |
+|--------------|--------|---------|---------|
+| 128 cols     | 294.58 | 2762.80 | 2354.23 |
+| 256 cols     | 609.28 | 5719.94 | 5147.95 |
+| 512 cols     | 1543.28| 11774.07| 13524.27 |
 
-Interpretation:
-- v2 is fastest but needs numerical/ordering fixes to eliminate the rare mismatches.
-- v3 trades some speed for more flexible scheduling; still needs correctness tuning.
+---
 
+## Kernel0 Version 1 Runtime (ms)
+
+| Data Set Size | Small | Medium | Large |
+|--------------|-------|--------|-------|
+| 128 cols     | 88.39 | 535.05 | 565.91 |
+| 256 cols     | 85.80 | 541.72 | 578.08 |
+| 512 cols     | 84.78 | 534.45 | 568.86 |
+
+---
+
+## Kernel0 Version 2 Runtime (ms)
+
+| Data Set Size | Small | Medium | Large |
+|--------------|-------|--------|-------|
+| 128 cols     | 6.91  | 16.44  | 5233.08 |
+| 256 cols     | 7.40  | 21.14  | 5321.99 |
+| 512 cols     | 8.98  | 32.97  | 5505.31 |
+
+---
+
+## Kernel0 Version 3 Runtime (ms)
+
+| Data Set Size | Small | Medium | Large |
+|--------------|-------|--------|-------|
+| 128 cols     | 48.71 | 224.20 | 1922.77 |
+| 256 cols     | 51.83 | 219.76 | 2355.89 |
+| 512 cols     | 56.71 | 233.28 | 3263.96 |
 ## Reproducing the table
 1) Build as above.  
 2) Ensure `data/` contains the three matrices named above.  
