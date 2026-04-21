@@ -67,7 +67,6 @@ __global__ void sptrsv_gpu1_kernel(
 }
 
 
-
 // Transpose helpers (host-side, called once before and after the kernel loop)
 // row-major src -> column-major dst: dst[j*numRows + i] = src[i*numCols + j]
 static void transposeToColMajor(const float* src, float* dst,
@@ -88,37 +87,59 @@ static void transposeToRowMajor(const float* src, float* dst,
 }
 
 
+// Static state shared between preprocess, solve, and postprocess.
+// Safe because only one kernel1 run is active at a time.
+static CSRMatrix*    s_L_r         = NULL;  // device ptr to CSR matrix struct
+static DenseMatrix*  s_B           = NULL;  // device ptr to B struct
+static DenseMatrix*  s_X           = NULL;  // device ptr to X struct
+static float*        s_B_dev_vals  = NULL;  // device ptr to B's float data
+static float*        s_X_dev_vals  = NULL;  // device ptr to X's float data
+static unsigned int* s_levelRows_d = NULL;  // device array of row indices grouped by level
+static unsigned int* s_levelCount  = NULL;  // host array: number of rows per level
+static unsigned int* s_levelOffsets= NULL;  // host array: start offset of each level in levelRows
+static unsigned int  s_numLevels   = 0;
+static unsigned int  s_numRows     = 0;
+static unsigned int  s_numCols     = 0;
 
-// Host wrapper
-void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
-                 CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
+
+// sptrsv_gpu1_preprocess
+// Performs all setup that does NOT belong in the timed region:
+//   - transposes B to column-major on the device
+//   - computes the level sets from the sparsity pattern of L
+//   - uploads the levelRows array to the device
+// Results are stored in the static state above for solve() to consume.
+void sptrsv_gpu1_preprocess(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
+                             CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
 {
     unsigned int numRows = L_r_host->numRows;
     unsigned int n       = numRows;
     size_t       sz      = (size_t)numRows * numCols * sizeof(float);
 
-    // the DenseMatrix struct itself lives on the device, so we download the header
-    // to get the device-side values pointer before touching the float data
+    // store pointers so solve() and postprocess() can reference them without extra args
+    s_L_r    = L_r;
+    s_B      = B;
+    s_X      = X;
+    s_numRows = numRows;
+    s_numCols = numCols;
+
+    // download struct headers to extract the device-side float data pointers
     DenseMatrix B_hdr, X_hdr;
     CUDA_ERROR_CHECK(cudaMemcpy(&B_hdr, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost));
     CUDA_ERROR_CHECK(cudaMemcpy(&X_hdr, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost));
+    s_B_dev_vals = B_hdr.values;  // device float* for B's data
+    s_X_dev_vals = X_hdr.values;  // device float* for X's data
 
-    // reusable host scratch buffer to avoid repeated malloc for large matrices
+    // transpose B from row-major to column-major on the device
     float* tmp = (float*)malloc(sz);
-
-
-    // Step 0: transpose B on device from row-major to column-major
-    // download B, rearrange in place on the host, upload back to the same device buffer
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, B_hdr.values, sz, cudaMemcpyDeviceToHost));
     float* B_cm = (float*)malloc(sz);
+    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_B_dev_vals, sz, cudaMemcpyDeviceToHost));
     transposeToColMajor(tmp, B_cm, numRows, numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(B_hdr.values, B_cm, sz, cudaMemcpyHostToDevice));
+    CUDA_ERROR_CHECK(cudaMemcpy(s_B_dev_vals, B_cm, sz, cudaMemcpyHostToDevice));
     free(B_cm);
+    free(tmp);
 
-
-    // Level-set preprocessing (identical to kernel0_v2)
+    // level-set analysis -- identical to kernel0_v2
     // level[i] = length of the longest dependency chain ending at row i
-    // computed in one forward pass since L is lower-triangular
     unsigned int* level = (unsigned int*)calloc(n, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i) {
         for (unsigned int idx = L_r_host->rowPtrs[i];
@@ -137,84 +158,103 @@ void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     for (unsigned int i = 0; i < n; ++i)
         if (level[i] > numLevels) numLevels = level[i];
     numLevels++;
+    s_numLevels = numLevels;
 
     // count rows per level to size each kernel launch
-    unsigned int* levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
+    s_levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i)
-        levelCount[level[i]]++;
+        s_levelCount[level[i]]++;
 
-    // prefix sum: levelOffsets[k] = start index of level k inside levelRows[]
-    unsigned int* levelOffsets = (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
-    levelOffsets[0] = 0;
+    // prefix sum: s_levelOffsets[k] = start index of level k inside levelRows[]
+    s_levelOffsets = (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
+    s_levelOffsets[0] = 0;
     for (unsigned int k = 0; k < numLevels; ++k)
-        levelOffsets[k + 1] = levelOffsets[k] + levelCount[k];
+        s_levelOffsets[k + 1] = s_levelOffsets[k] + s_levelCount[k];
 
     // pack row indices grouped by level; fillPos[k] is the write cursor for level k
     unsigned int* levelRows = (unsigned int*)malloc(n * sizeof(unsigned int));
     unsigned int* fillPos   = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i) {
         unsigned int k = level[i];
-        levelRows[levelOffsets[k] + fillPos[k]] = i;
+        levelRows[s_levelOffsets[k] + fillPos[k]] = i;
         fillPos[k]++;
     }
 
-    // upload the full levelRows array once; kernel launches index into it via pointer offsets
-    unsigned int* levelRows_d;
-    CUDA_ERROR_CHECK(cudaMalloc((void**)&levelRows_d, n * sizeof(unsigned int)));
-    CUDA_ERROR_CHECK(cudaMemcpy(levelRows_d, levelRows, n * sizeof(unsigned int),
+    // upload the full levelRows array once; solve() indexes into it via pointer offsets
+    CUDA_ERROR_CHECK(cudaMalloc((void**)&s_levelRows_d, n * sizeof(unsigned int)));
+    CUDA_ERROR_CHECK(cudaMemcpy(s_levelRows_d, levelRows, n * sizeof(unsigned int),
                                 cudaMemcpyHostToDevice));
 
+    free(level);
+    free(levelRows);
+    free(fillPos);
+}
 
-    // Kernel launch loop (identical structure to kernel0_v2)
+
+// sptrsv_gpu1_solve
+// The timed region: launches the level-set kernels and nothing else.
+// All setup was done in preprocess(); all cleanup is in postprocess().
+void sptrsv_gpu1_solve()
+{
     // fixed 16x16 block: x covers RHS columns, y covers rows within the level
     const dim3 blockDim(16, 16);
 
-    for (unsigned int k = 0; k < numLevels; ++k) {
-        unsigned int levelSize  = levelCount[k];
-        unsigned int levelStart = levelOffsets[k];
+    for (unsigned int k = 0; k < s_numLevels; ++k) {
+        unsigned int levelSize  = s_levelCount[k];
+        unsigned int levelStart = s_levelOffsets[k];
 
         // grid y-dim adapts to how many rows are in this level
         dim3 gridDim(
-            (numCols   + blockDim.x - 1) / blockDim.x,
-            (levelSize + blockDim.y - 1) / blockDim.y
+            (s_numCols   + blockDim.x - 1) / blockDim.x,
+            (levelSize   + blockDim.y - 1) / blockDim.y
         );
 
-        // pass a pointer offset into levelRows_d so the kernel sees indices [0, levelSize)
+        // pass a pointer offset into s_levelRows_d so the kernel sees indices [0, levelSize)
         sptrsv_gpu1_kernel<<<gridDim, blockDim>>>(
-            L_r, B, X,
-            levelRows_d + levelStart,
-            levelSize, numRows, numCols
+            s_L_r, s_B, s_X,
+            s_levelRows_d + levelStart,
+            levelSize, s_numRows, s_numCols
         );
 
         // barrier: all X writes from level k must be globally visible before level k+1 reads them
         CUDA_ERROR_CHECK(cudaGetLastError());
         CUDA_ERROR_CHECK(cudaDeviceSynchronize());
     }
+}
 
 
-    // Transpose X back to row-major and restore B to row-major
-    // X is currently column-major on the device; verify() in main.cu expects row-major
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, X_hdr.values, sz, cudaMemcpyDeviceToHost));
-    float* X_rm = (float*)malloc(sz);
-    transposeToRowMajor(tmp, X_rm, numRows, numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(X_hdr.values, X_rm, sz, cudaMemcpyHostToDevice));
-    free(X_rm);
+// sptrsv_gpu1_postprocess
+// Performs all teardown that does NOT belong in the timed region:
+//   - transposes X back to row-major so verify() in main.cu sees the right layout
+//   - restores B to row-major so the caller's buffer is left in its original state
+//   - frees all precomputed state
+void sptrsv_gpu1_postprocess()
+{
+    size_t sz = (size_t)s_numRows * s_numCols * sizeof(float);
+    float* tmp = (float*)malloc(sz);
+    float* buf = (float*)malloc(sz);
 
-    // restore B to row-major so the caller's buffer is left in its original state
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, B_hdr.values, sz, cudaMemcpyDeviceToHost));
-    float* B_rm = (float*)malloc(sz);
-    transposeToRowMajor(tmp, B_rm, numRows, numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(B_hdr.values, B_rm, sz, cudaMemcpyHostToDevice));
-    free(B_rm);
+    // X is column-major on device; verify() expects row-major
+    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_X_dev_vals, sz, cudaMemcpyDeviceToHost));
+    transposeToRowMajor(tmp, buf, s_numRows, s_numCols);
+    CUDA_ERROR_CHECK(cudaMemcpy(s_X_dev_vals, buf, sz, cudaMemcpyHostToDevice));
+
+    // restore B to row-major so the caller's device buffer is unchanged
+    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_B_dev_vals, sz, cudaMemcpyDeviceToHost));
+    transposeToRowMajor(tmp, buf, s_numRows, s_numCols);
+    CUDA_ERROR_CHECK(cudaMemcpy(s_B_dev_vals, buf, sz, cudaMemcpyHostToDevice));
 
     free(tmp);
+    free(buf);
 
+    // free level-set state
+    CUDA_ERROR_CHECK(cudaFree(s_levelRows_d));
+    free(s_levelCount);
+    free(s_levelOffsets);
 
-    // Cleanup
-    CUDA_ERROR_CHECK(cudaFree(levelRows_d));
-    free(level);
-    free(levelCount);
-    free(levelOffsets);
-    free(levelRows);
-    free(fillPos);
+    // clear statics so a subsequent call starts fresh
+    s_L_r = NULL; s_B = NULL; s_X = NULL;
+    s_B_dev_vals = NULL; s_X_dev_vals = NULL;
+    s_levelRows_d = NULL; s_levelCount = NULL; s_levelOffsets = NULL;
+    s_numLevels = 0; s_numRows = 0; s_numCols = 0;
 }

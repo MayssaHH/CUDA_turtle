@@ -35,8 +35,7 @@ void verify(DenseMatrix* result, DenseMatrix* reference) {
 void (*sptrsv_gpu[])(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols) = {
     sptrsv_gpu0_v1,
     sptrsv_gpu0_v2,
-    sptrsv_gpu0_v3,
-    sptrsv_gpu1
+    sptrsv_gpu0_v3
 };
 
 
@@ -172,12 +171,12 @@ int main(int argc, char* argv[]) {
         CUDA_ERROR_CHECK(cudaDeviceSynchronize());
 
         
-        for(unsigned int gpuVersion = 0; gpuVersion < 4; ++gpuVersion){
+        // versions 0-2: standard path through the function pointer array
+        for(unsigned int gpuVersion = 0; gpuVersion < 3; ++gpuVersion){
             if(runGPUVersion[gpuVersion]){
-               
+
                 printf("Running GPU version %u...\n", gpuVersion);
-                
-                // Compute on GPU
+
                 Timer timer;
                 startTime(&timer);
                 sptrsv_gpu[gpuVersion](csc_d, csr_d, dense_d_128, result_d_128, csc_h, csr_h, dense_h_128->numCols);
@@ -185,61 +184,100 @@ int main(int argc, char* argv[]) {
                 stopTime(&timer);
                 printElapsedTime(timer, "    GPU kernel time(128 cols)", GREEN);
 
-                // Copy data from GPU
                 copyDenseMatrixFromGPU(result_d_128, result_gpu_128);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-
-                // Verify
                 verify(result_gpu_128, result_h_128);
 
-                // Free GPU memory for this version
                 freeDenseMatrixOnGPU(result_d_128);
                 result_d_128 = createEmptyDenseMatrixOnGPU(result_h_128->numRows, result_h_128->numCols);
                 copyCSRMatrixToGPU(csr_h, csr_d);
                 copyCSCMatrixToGPU(csc_h, csc_d);
 
-
-                // Compute on GPU
                 startTime(&timer);
                 sptrsv_gpu[gpuVersion](csc_d, csr_d, dense_d_256, result_d_256, csc_h, csr_h, dense_h_256->numCols);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
                 stopTime(&timer);
-                printElapsedTime(timer, "    GPU kernel time(256 cols)", GREEN);    
+                printElapsedTime(timer, "    GPU kernel time(256 cols)", GREEN);
 
-                // Copy data from GPU
                 copyDenseMatrixFromGPU(result_d_256, result_gpu_256);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-
-                // Verify
                 verify(result_gpu_256, result_h_256);
 
-                // Free GPU memory for this version
                 freeDenseMatrixOnGPU(result_d_256);
                 result_d_256 = createEmptyDenseMatrixOnGPU(result_h_256->numRows, result_h_256->numCols);
                 copyCSRMatrixToGPU(csr_h, csr_d);
                 copyCSCMatrixToGPU(csc_h, csc_d);
-                
-                // Compute on GPU
+
                 startTime(&timer);
                 sptrsv_gpu[gpuVersion](csc_d, csr_d, dense_d_512, result_d_512, csc_h, csr_h, dense_h_512->numCols);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
                 stopTime(&timer);
                 printElapsedTime(timer, "    GPU kernel time(512 cols)", GREEN);
 
-                // Copy data from GPU
                 copyDenseMatrixFromGPU(result_d_512, result_gpu_512);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-
-                // Verify
                 verify(result_gpu_512, result_h_512);
 
-                // Free GPU memory for this version
                 freeDenseMatrixOnGPU(result_d_512);
                 result_d_512 = createEmptyDenseMatrixOnGPU(result_h_512->numRows, result_h_512->numCols);
                 copyCSRMatrixToGPU(csr_h, csr_d);
                 copyCSCMatrixToGPU(csc_h, csc_d);
-        
             }
+        }
+
+        // version 3 (kernel1): preprocess and postprocess are outside the timer;
+        // only the kernel launch loop is measured
+        if(runGPUVersion[3]){
+            printf("Running GPU version 3 (kernel1 - column-major)...\n");
+            Timer timer;
+
+            // 128 cols
+            sptrsv_gpu1_preprocess(csc_d, csr_d, dense_d_128, result_d_128, csc_h, csr_h, dense_h_128->numCols);
+            startTime(&timer);
+            sptrsv_gpu1_solve();
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            stopTime(&timer);
+            printElapsedTime(timer, "    GPU kernel time(128 cols)", GREEN);
+            sptrsv_gpu1_postprocess();
+            copyDenseMatrixFromGPU(result_d_128, result_gpu_128);
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            verify(result_gpu_128, result_h_128);
+            freeDenseMatrixOnGPU(result_d_128);
+            result_d_128 = createEmptyDenseMatrixOnGPU(result_h_128->numRows, result_h_128->numCols);
+            copyCSRMatrixToGPU(csr_h, csr_d);
+            copyCSCMatrixToGPU(csc_h, csc_d);
+
+            // 256 cols
+            sptrsv_gpu1_preprocess(csc_d, csr_d, dense_d_256, result_d_256, csc_h, csr_h, dense_h_256->numCols);
+            startTime(&timer);
+            sptrsv_gpu1_solve();
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            stopTime(&timer);
+            printElapsedTime(timer, "    GPU kernel time(256 cols)", GREEN);
+            sptrsv_gpu1_postprocess();
+            copyDenseMatrixFromGPU(result_d_256, result_gpu_256);
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            verify(result_gpu_256, result_h_256);
+            freeDenseMatrixOnGPU(result_d_256);
+            result_d_256 = createEmptyDenseMatrixOnGPU(result_h_256->numRows, result_h_256->numCols);
+            copyCSRMatrixToGPU(csr_h, csr_d);
+            copyCSCMatrixToGPU(csc_h, csc_d);
+
+            // 512 cols
+            sptrsv_gpu1_preprocess(csc_d, csr_d, dense_d_512, result_d_512, csc_h, csr_h, dense_h_512->numCols);
+            startTime(&timer);
+            sptrsv_gpu1_solve();
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            stopTime(&timer);
+            printElapsedTime(timer, "    GPU kernel time(512 cols)", GREEN);
+            sptrsv_gpu1_postprocess();
+            copyDenseMatrixFromGPU(result_d_512, result_gpu_512);
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            verify(result_gpu_512, result_h_512);
+            freeDenseMatrixOnGPU(result_d_512);
+            result_d_512 = createEmptyDenseMatrixOnGPU(result_h_512->numRows, result_h_512->numCols);
+            copyCSRMatrixToGPU(csr_h, csr_d);
+            copyCSCMatrixToGPU(csc_h, csc_d);
         }
 
         // Free GPU memory
