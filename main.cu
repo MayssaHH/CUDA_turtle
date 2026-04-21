@@ -35,7 +35,8 @@ void verify(DenseMatrix* result, DenseMatrix* reference) {
 void (*sptrsv_gpu[])(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols) = {
     sptrsv_gpu0_v1,
     sptrsv_gpu0_v2,
-    sptrsv_gpu0_v3
+    sptrsv_gpu0_v3,
+    sptrsv_gpu1
 };
 
 
@@ -45,11 +46,11 @@ int main(int argc, char* argv[]) {
     setbuf(stdout, NULL);
     const char* dataset = "data/rajat18.txt";
     unsigned int runCPUVersion = 1;
-    unsigned int runGPUVersion[3] = { 0 };
+    unsigned int runGPUVersion[4] = { 0 };
     unsigned int useGPU = 0;
     int opt;
     // Parse arguments
-    while ((opt = getopt(argc, argv, "d:s012")) >= 0) {
+    while ((opt = getopt(argc, argv, "d:s0123")) >= 0) {
         switch (opt) {
             case 'd':
                 if (strcmp(optarg, "s") == 0) {
@@ -78,6 +79,10 @@ int main(int argc, char* argv[]) {
                 break;
             case '2':
                 runGPUVersion[2] = 1;
+                useGPU = 1;
+                break;
+            case '3':
+                runGPUVersion[3] = 1;
                 useGPU = 1;
                 break;
             default:
@@ -167,7 +172,7 @@ int main(int argc, char* argv[]) {
         CUDA_ERROR_CHECK(cudaDeviceSynchronize());
 
         
-        for(unsigned int gpuVersion = 0; gpuVersion < 3; ++gpuVersion){
+        for(unsigned int gpuVersion = 0; gpuVersion < 4; ++gpuVersion){
             if(runGPUVersion[gpuVersion]){
                
                 printf("Running GPU version %u...\n", gpuVersion);
