@@ -1,10 +1,9 @@
 
-NVCC       = nvcc
-NVCC_FLAGS = -O3
+NVCC        = nvcc
+NVCC_FLAGS  = -O3
+OBJ         = main.o matrix.o kernelCPU0.o kernel0_v1.o kernel0_v2.o kernel0.o kernel1.o kernel2.o kernel3.o
+EXE         = sptrsv
 
-EXE        = sptrsv
-SOURCES    = main.cu matrix.cu kernelCPU0.cu kernel0_v1.cu kernel0_v2.cu kernel0_v3.cu kernel1.cu kernel2.cu kernel3.cu
-OBJ        = $(SOURCES:.cu=.o)
 
 default: $(EXE)
 
@@ -12,8 +11,7 @@ default: $(EXE)
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 $(EXE): $(OBJ)
-	$(NVCC) $(NVCC_FLAGS) $(OBJ) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(OBJ) -o $(EXE)
 
-.PHONY: clean
 clean:
 	rm -rf $(OBJ) $(EXE)

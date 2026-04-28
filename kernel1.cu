@@ -1,260 +1,233 @@
 // kernel1.cu
+
+// This is another GPU implementation of the sparse triangular solve (SpTRSV).
+// This version is based on the level-set version from kernel0, but now we try
+// to optimize the sparse inner loop itself using shared memory.
 //
-// First Optimization over kernel0_v2: column-major dense matrix layout.
+// Main idea:
+// - In the level-set version, rows in the same level are independent, so they
+//   can be solved in parallel.
+// - But inside each row solve, every thread working on a different RHS column
+//   still reads the same sparse row structure again and again from global
+//   memory.
+// - More specifically, for one fixed row i, all x-threads of that row walk
+//   through exactly the same CSR entries:
+//      L_r->colIdxs[row_start ... row_end-1]
+//      L_r->values[row_start ... row_end-1]
+// - So there is a lot of redundant global memory traffic there.
 //
-// In kernel0_v2, B and X are row-major: X(j, b) lives at j*numCols + b.
-// The sparse inner loop reads X(j, b) for irregular j values, jumping by
-// strides of numCols between accesses -- each cache line fetch uses only
-// 1 of 32 floats (~3% utilization).
+// What we do in this file:
+// - We keep the same level-set scheduling idea from kernel0.
+// - We still parallelize:
+//   - across RHS columns in x
+//   - across rows in the same level in y
+// - But now, for each row, the x-threads cooperate to load a tile of the CSR
+//   row into shared memory first.
+// - Then all those threads reuse that shared tile instead of rereading the
+//   same sparse entries from global memory many times.
 //
-// Fix: store B and X in column-major order: X(j, b) lives at b*numRows + j.
-// All values a thread ever reads are contiguous in memory, so cache lines
-// fetched for one j are reused for nearby j values in the same sparse row.
+// Important detail:
+// - B and X stay in the normal row-major layout here.
+// - So this version is only changing how the sparse row of L is accessed.
+// - We are not doing any transpose or layout conversion in this file.
 //
-// The level-set scheduling, grid/block dimensions, and launch loop are
-// identical to kernel0_v2. Only the index arithmetic changes in support of the first optimization.
+// So compared to kernel0:
+// - kernel0 already improved parallelism using levels
+// - this version keeps that idea
+// - but adds shared memory tiling to reduce repeated reads of CSR structure
+//
+// Block structure used here:
+// - TILE_DIM_X = 64 threads for RHS columns
+// - TILE_DIM_Y = 4 rows from the same level per block
+// - each y-row inside the block gets its own shared-memory slice
 
 #include "common.h"
 
+#define TILE_DIM_X 64
+#define TILE_DIM_Y 4
 
-// Each thread owns one (row i, RHS column b) pair.
-// x-dim of the grid covers RHS columns, y-dim covers rows within the current level.
-// B and X are expected in column-major layout when this kernel runs.
+
 __global__ void sptrsv_gpu1_kernel(
         CSRMatrix*    L_r,
         DenseMatrix*  B,
         DenseMatrix*  X,
-        unsigned int* levelRows,   // row indices for the current level (device ptr, pre-offset)
-        unsigned int  levelSize,   // number of rows in this level
-        unsigned int  numRows,     // total matrix rows, needed for column-major addressing
-        unsigned int  numCols)     // number of RHS columns
+        unsigned int* levelRows,
+        unsigned int  levelSize,
+        unsigned int  numCols)
 {
-    unsigned int b        = blockIdx.x * blockDim.x + threadIdx.x;  // RHS column index
-    unsigned int levelIdx = blockIdx.y * blockDim.y + threadIdx.y;  // index within level
+    // Thread mapping:
+    // - x dimension handles RHS columns
+    // - y dimension handles rows inside the current level
+    unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int r = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // threads at the edge of the grid that fall outside the valid range exit early
-    if (b >= numCols || levelIdx >= levelSize) return;
+    // Guard against out-of-bounds threads
+    if (b >= numCols || r >= levelSize) return;
 
-    // translate within-level index to the actual matrix row
-    unsigned int i = levelRows[levelIdx];
+    // Actual matrix row for this thread
+    unsigned int i  = levelRows[r];
+    unsigned int nB = numCols;
 
-    // column-major read: column b, row i -> address b*numRows + i
-    // (in row-major this was i*numCols + b, which strided across memory as i changed)
-    float sum  = B->values[b * numRows + i];
-    float diag = 1.0f;  // default diagonal; overwritten when we encounter L(i,i)
+    // CSR range for row i
+    unsigned int row_start = L_r->rowPtrs[i];
+    unsigned int row_end   = L_r->rowPtrs[i + 1];
+    unsigned int row_len   = row_end - row_start;
 
-    // sparse inner loop over nonzeros in row i of L
-    for (unsigned int idx = L_r->rowPtrs[i];
-                      idx < L_r->rowPtrs[i + 1]; ++idx) {
+    // Shared memory buffers:
+    // For each ty row in the block, we store one tile of:
+    // - column indices
+    // - values
+    // This way different matrix rows do not overwrite each other's tile
+    __shared__ unsigned int s_col[TILE_DIM_Y][TILE_DIM_X];
+    __shared__ float        s_val[TILE_DIM_Y][TILE_DIM_X];
 
-        unsigned int col = L_r->colIdxs[idx];
-        float        val = L_r->values[idx];
+    // Start from the RHS value B(i,b)
+    float sum  = B->values[i * nB + b];
 
-        if (col < i) {
-            // off-diagonal: subtract contribution of already-solved row col
-            // column-major read: b*numRows + col -- stays in the same contiguous
-            // block of memory as all other reads this thread makes, unlike row-major
-            sum -= val * X->values[b * numRows + col];
+    // This will hold the diagonal entry L(i,i)
+    float diag = 1.0f;
 
-        } else if (col == i) {
-            // diagonal: record L(i,i); guard against explicit zero just in case
-            diag = (val != 0.0f) ? val : 1.0f;
+    // Traverse row i tile by tile
+    for (unsigned int base = 0; base < row_len; base += TILE_DIM_X) {
+
+        // Cooperative load:
+        // all x-threads for this row load one sparse entry each into shared
+        // memory, so later all of them can reuse the same tile
+        unsigned int k = base + threadIdx.x;
+        if (k < row_len) {
+            s_col[threadIdx.y][threadIdx.x] = L_r->colIdxs[row_start + k];
+            s_val[threadIdx.y][threadIdx.x] = L_r->values[row_start + k];
+        } else {
+            // Pad the tile if the row ends before the tile ends
+            // Using col == i as a sentinel is safe here:
+            // it does not add to sum, and the value is 0 anyway
+            s_col[threadIdx.y][threadIdx.x] = i;
+            s_val[threadIdx.y][threadIdx.x] = 0.0f;
         }
+
+        // Make sure the whole tile is visible before any thread starts using it
+        __syncthreads();
+
+        // Number of valid sparse entries inside this tile
+        unsigned int tile_limit = min(TILE_DIM_X, row_len - base);
+
+        // Now every x-thread solving this row reuses the same shared tile
+        for (unsigned int j = 0; j < tile_limit; ++j) {
+            unsigned int col = s_col[threadIdx.y][j];
+            float        val = s_val[threadIdx.y][j];
+
+            // If col < i, this is a previously solved dependency contribution
+            if (col < i) {
+                sum -= val * X->values[col * nB + b];
+
+            // If col == i, this is the diagonal element needed at the end
+            } else if (col == i) {
+                diag = (val != 0.0f) ? val : 1.0f;
+            }
+        }
+
+        // Make sure no thread is still using this tile before we overwrite it
+        __syncthreads();
     }
 
-    // write solution X(i,b) in column-major layout
-    X->values[b * numRows + i] = sum / diag;
+    // Final forward substitution result for X(i,b)
+    X->values[i * nB + b] = sum / diag;
 }
 
 
-// Transpose helpers (host-side, called once before and after the kernel loop)
-// row-major src -> column-major dst: dst[j*numRows + i] = src[i*numCols + j]
-static void transposeToColMajor(const float* src, float* dst,
-                                 unsigned int numRows, unsigned int numCols)
+void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
+                 CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
 {
-    for (unsigned int i = 0; i < numRows; ++i)
-        for (unsigned int j = 0; j < numCols; ++j)
-            dst[j * numRows + i] = src[i * numCols + j];
-}
+    // These inputs are not needed here
+    // This version still relies on CSR for dependency analysis and for the row
+    // traversal inside the kernel
+    (void)L_c;
+    (void)L_c_host;
 
-// column-major src -> row-major dst: inverse of transposeToColMajor
-static void transposeToRowMajor(const float* src, float* dst,
-                                 unsigned int numRows, unsigned int numCols)
-{
-    for (unsigned int j = 0; j < numCols; ++j)
-        for (unsigned int i = 0; i < numRows; ++i)
-            dst[i * numCols + j] = src[j * numRows + i];
-}
+    unsigned int n = L_r_host->numRows;
 
-
-// Static state shared between preprocess, solve, and postprocess.
-// Safe because only one kernel1 run is active at a time.
-static CSRMatrix*    s_L_r         = NULL;  // device ptr to CSR matrix struct
-static DenseMatrix*  s_B           = NULL;  // device ptr to B struct
-static DenseMatrix*  s_X           = NULL;  // device ptr to X struct
-static float*        s_B_dev_vals  = NULL;  // device ptr to B's float data
-static float*        s_X_dev_vals  = NULL;  // device ptr to X's float data
-static unsigned int* s_levelRows_d = NULL;  // device array of row indices grouped by level
-static unsigned int* s_levelCount  = NULL;  // host array: number of rows per level
-static unsigned int* s_levelOffsets= NULL;  // host array: start offset of each level in levelRows
-static unsigned int  s_numLevels   = 0;
-static unsigned int  s_numRows     = 0;
-static unsigned int  s_numCols     = 0;
-
-
-// sptrsv_gpu1_preprocess
-// Performs all setup that does NOT belong in the timed region:
-//   - transposes B to column-major on the device
-//   - computes the level sets from the sparsity pattern of L
-//   - uploads the levelRows array to the device
-// Results are stored in the static state above for solve() to consume.
-void sptrsv_gpu1_preprocess(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
-                             CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
-{
-    unsigned int numRows = L_r_host->numRows;
-    unsigned int n       = numRows;
-    size_t       sz      = (size_t)numRows * numCols * sizeof(float);
-
-    // store pointers so solve() and postprocess() can reference them without extra args
-    s_L_r    = L_r;
-    s_B      = B;
-    s_X      = X;
-    s_numRows = numRows;
-    s_numCols = numCols;
-
-    // download struct headers to extract the device-side float data pointers
-    DenseMatrix B_hdr, X_hdr;
-    CUDA_ERROR_CHECK(cudaMemcpy(&B_hdr, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost));
-    CUDA_ERROR_CHECK(cudaMemcpy(&X_hdr, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost));
-    s_B_dev_vals = B_hdr.values;  // device float* for B's data
-    s_X_dev_vals = X_hdr.values;  // device float* for X's data
-
-    // transpose B from row-major to column-major on the device
-    float* tmp = (float*)malloc(sz);
-    float* B_cm = (float*)malloc(sz);
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_B_dev_vals, sz, cudaMemcpyDeviceToHost));
-    transposeToColMajor(tmp, B_cm, numRows, numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(s_B_dev_vals, B_cm, sz, cudaMemcpyHostToDevice));
-    free(B_cm);
-    free(tmp);
-
-    // level-set analysis -- identical to kernel0_v2
-    // level[i] = length of the longest dependency chain ending at row i
+    // Step 1: level-set analysis
+    // level[i] = longest dependency chain ending at row i
     unsigned int* level = (unsigned int*)calloc(n, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i) {
-        for (unsigned int idx = L_r_host->rowPtrs[i];
-                          idx < L_r_host->rowPtrs[i + 1]; ++idx) {
+        for (unsigned int idx = L_r_host->rowPtrs[i]; idx < L_r_host->rowPtrs[i + 1]; ++idx) {
             unsigned int col = L_r_host->colIdxs[idx];
             if (col < i) {
-                // row i depends on col, so it must sit at a strictly deeper level
+                // If row i depends on row col, then i must come after col
                 unsigned int candidate = level[col] + 1;
                 if (candidate > level[i]) level[i] = candidate;
             }
         }
     }
 
-    // levels are 0-indexed, so total count is max level + 1
+    // Step 2: compute total number of levels
     unsigned int numLevels = 0;
     for (unsigned int i = 0; i < n; ++i)
         if (level[i] > numLevels) numLevels = level[i];
     numLevels++;
-    s_numLevels = numLevels;
 
-    // count rows per level to size each kernel launch
-    s_levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
+    // Step 3: count rows per level
+    unsigned int* levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i)
-        s_levelCount[level[i]]++;
+        levelCount[level[i]]++;
 
-    // prefix sum: s_levelOffsets[k] = start index of level k inside levelRows[]
-    s_levelOffsets = (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
-    s_levelOffsets[0] = 0;
+    // Step 4: prefix sum to know where each level begins inside levelRows
+    unsigned int* levelOffsets = (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
+    levelOffsets[0] = 0;
     for (unsigned int k = 0; k < numLevels; ++k)
-        s_levelOffsets[k + 1] = s_levelOffsets[k] + s_levelCount[k];
+        levelOffsets[k + 1] = levelOffsets[k] + levelCount[k];
 
-    // pack row indices grouped by level; fillPos[k] is the write cursor for level k
+    // Step 5: build levelRows
+    // This array stores actual row indices grouped by level
     unsigned int* levelRows = (unsigned int*)malloc(n * sizeof(unsigned int));
     unsigned int* fillPos   = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
     for (unsigned int i = 0; i < n; ++i) {
         unsigned int k = level[i];
-        levelRows[s_levelOffsets[k] + fillPos[k]] = i;
+        levelRows[levelOffsets[k] + fillPos[k]] = i;
         fillPos[k]++;
     }
 
-    // upload the full levelRows array once; solve() indexes into it via pointer offsets
-    CUDA_ERROR_CHECK(cudaMalloc((void**)&s_levelRows_d, n * sizeof(unsigned int)));
-    CUDA_ERROR_CHECK(cudaMemcpy(s_levelRows_d, levelRows, n * sizeof(unsigned int),
+    unsigned int* levelRows_d;
+    CUDA_ERROR_CHECK(cudaMalloc((void**)&levelRows_d, n * sizeof(unsigned int)));
+    CUDA_ERROR_CHECK(cudaMemcpy(levelRows_d, levelRows, n * sizeof(unsigned int),
                                 cudaMemcpyHostToDevice));
 
-    free(level);
-    free(levelRows);
-    free(fillPos);
-}
+    // 2D block:
+    // - x dimension for RHS columns
+    // - y dimension for rows inside the same level
+    const dim3 blockDim(TILE_DIM_X, TILE_DIM_Y);
 
+    // Step 6: solve the matrix one level at a time
+    // Rows in the same level are independent, but different levels still have
+    // dependencies, so we must synchronize between levels
+    for (unsigned int k = 0; k < numLevels; ++k) {
+        unsigned int levelSize  = levelCount[k];
+        unsigned int levelStart = levelOffsets[k];
 
-// sptrsv_gpu1_solve
-// The timed region: launches the level-set kernels and nothing else.
-// All setup was done in preprocess(); all cleanup is in postprocess().
-void sptrsv_gpu1_solve()
-{
-    // fixed 16x16 block: x covers RHS columns, y covers rows within the level
-    const dim3 blockDim(16, 16);
-
-    for (unsigned int k = 0; k < s_numLevels; ++k) {
-        unsigned int levelSize  = s_levelCount[k];
-        unsigned int levelStart = s_levelOffsets[k];
-
-        // grid y-dim adapts to how many rows are in this level
+        // Grid covers all (row, column) pairs in this level
         dim3 gridDim(
-            (s_numCols   + blockDim.x - 1) / blockDim.x,
-            (levelSize   + blockDim.y - 1) / blockDim.y
+            (numCols   + blockDim.x - 1) / blockDim.x,
+            (levelSize + blockDim.y - 1) / blockDim.y
         );
 
-        // pass a pointer offset into s_levelRows_d so the kernel sees indices [0, levelSize)
+        // Launch current level
         sptrsv_gpu1_kernel<<<gridDim, blockDim>>>(
-            s_L_r, s_B, s_X,
-            s_levelRows_d + levelStart,
-            levelSize, s_numRows, s_numCols
+            L_r, B, X,
+            levelRows_d + levelStart,
+            levelSize, numCols
         );
 
-        // barrier: all X writes from level k must be globally visible before level k+1 reads them
+        // Synchronization is necessary because the next level may read values
+        // produced by this level
         CUDA_ERROR_CHECK(cudaGetLastError());
         CUDA_ERROR_CHECK(cudaDeviceSynchronize());
     }
-}
 
-
-// sptrsv_gpu1_postprocess
-// Performs all teardown that does NOT belong in the timed region:
-//   - transposes X back to row-major so verify() in main.cu sees the right layout
-//   - restores B to row-major so the caller's buffer is left in its original state
-//   - frees all precomputed state
-void sptrsv_gpu1_postprocess()
-{
-    size_t sz = (size_t)s_numRows * s_numCols * sizeof(float);
-    float* tmp = (float*)malloc(sz);
-    float* buf = (float*)malloc(sz);
-
-    // X is column-major on device; verify() expects row-major
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_X_dev_vals, sz, cudaMemcpyDeviceToHost));
-    transposeToRowMajor(tmp, buf, s_numRows, s_numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(s_X_dev_vals, buf, sz, cudaMemcpyHostToDevice));
-
-    // restore B to row-major so the caller's device buffer is unchanged
-    CUDA_ERROR_CHECK(cudaMemcpy(tmp, s_B_dev_vals, sz, cudaMemcpyDeviceToHost));
-    transposeToRowMajor(tmp, buf, s_numRows, s_numCols);
-    CUDA_ERROR_CHECK(cudaMemcpy(s_B_dev_vals, buf, sz, cudaMemcpyHostToDevice));
-
-    free(tmp);
-    free(buf);
-
-    // free level-set state
-    CUDA_ERROR_CHECK(cudaFree(s_levelRows_d));
-    free(s_levelCount);
-    free(s_levelOffsets);
-
-    // clear statics so a subsequent call starts fresh
-    s_L_r = NULL; s_B = NULL; s_X = NULL;
-    s_B_dev_vals = NULL; s_X_dev_vals = NULL;
-    s_levelRows_d = NULL; s_levelCount = NULL; s_levelOffsets = NULL;
-    s_numLevels = 0; s_numRows = 0; s_numCols = 0;
+    // Cleanup
+    CUDA_ERROR_CHECK(cudaFree(levelRows_d));
+    free(level);
+    free(levelCount);
+    free(levelOffsets);
+    free(levelRows);
+    free(fillPos);
 }

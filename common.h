@@ -1,5 +1,3 @@
-// common.h
-
 #ifndef _COMMON_H_
 #define _COMMON_H_
 
@@ -20,17 +18,11 @@
 
 void sptrsv_cpu(CSRMatrix* L, DenseMatrix* B, DenseMatrix* X);
 void sptrsv_gpu0_v1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
+void sptrsv_gpu0(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
 void sptrsv_gpu0_v2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
-void sptrsv_gpu0_v3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
-void sptrsv_gpu1_preprocess(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
-void sptrsv_gpu1_solve();
-void sptrsv_gpu1_postprocess();
-void sptrsv_gpu2_preprocess(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
-void sptrsv_gpu2_solve();
-void sptrsv_gpu2_postprocess();
-void sptrsv_gpu3_preprocess(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
-void sptrsv_gpu3_solve();
-void sptrsv_gpu3_postprocess();
+void sptrsv_gpu2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
+void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
+void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols);
 /*void spmspm_cpu1();
 void spmspm_gpu0();
 void spmspm_gpu1();

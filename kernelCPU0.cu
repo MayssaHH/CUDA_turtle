@@ -1,5 +1,4 @@
-// kernel.cu
-
+// kernelCPU0.cu
 
 #include "common.h"
 
@@ -31,7 +30,7 @@ void sptrsv_cpu(CSRMatrix* L, DenseMatrix* B, DenseMatrix* X){
             float sum = B->values[i * nB + b];
             // This variable will store the diagonal entry L(i,i) (the coefficient of the target variable i particular iteration), which is needed at the end to divide the sum and solve for X(i,b)
             float diag = 0.0f;
-            
+
             // Traverse all nonzero entries in row i of L
             for(unsigned int idx = L->rowPtrs[i]; idx < L->rowPtrs[i + 1]; ++idx){
                 // Column index of the current nonzero entry

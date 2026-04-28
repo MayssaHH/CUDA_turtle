@@ -2,86 +2,155 @@
 
 #include "common.h"
 
-// This is the second GPU implementation of the sparse triangular solve (SpTRSV).
-// In this version, we go beyond simple column-wise parallelism and exploit
-// additional parallelism across rows using a level-set strategy.
+// Dynamic dependency scheduling variant for kernel0.
+// This keeps the kernel0_v2.cu file aligned with the exported symbol names.
 //
-// Key idea:
-// - In forward substitution, row i depends on rows j < i such that L(i,j) ≠ 0.
-// - These dependencies form a directed acyclic graph (DAG).
-// - We assign each row a "level" such that rows in the same level have no
-//   dependencies on each other and can therefore be solved in parallel.
-// - The solve proceeds level by level: within each level, all rows are processed
-//   in parallel, and synchronization is enforced between levels.
+// Idea:
+// Each row keeps track of how many dependencies are still unresolved.
+// A row becomes ready once all rows it depends on are completed.
+// Blocks repeatedly pick a ready row, compute it, then update its dependents.
 //
-// Parallelization strategy:
-// - Parallelize across RHS columns (b) as before.
-// - Additionally parallelize across rows within the same level.
-// - Each thread computes one (row, column) pair.
+// Compared to kernel0.cu:
+// kernel0.cu uses strict level by level synchronization.
+// Here we allow rows to be processed as soon as they become ready.
+// This removes global barriers between levels and increases parallelism.
 
 __global__ void sptrsv_gpu0_kernel_v2(
         CSRMatrix*    L_r,
         DenseMatrix*  B,
         DenseMatrix*  X,
-        unsigned int* levelRows,
-        unsigned int  levelSize,
-        unsigned int  numCols)
+        int*          depCounter,
+        int*          rowReady,
+        unsigned int* dependents,
+        unsigned int* dependentOffsets,
+        unsigned int  numRows,
+        unsigned int  numCols,
+        int*          completedRows)
 {
-    // Thread mapping:
-    // - x-dimension handles RHS columns
-    // - y-dimension handles rows within the current level
-    unsigned int b        = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int levelIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    // Use volatile so that updates from other blocks are always visible
+    volatile int* rowReady_v = (volatile int*)rowReady;
 
-    // Guard against out-of-bounds threads
-    if (b >= numCols || levelIdx >= levelSize) return;
+    // shared variable used to broadcast the claimed row to all threads
+    __shared__ int sharedRow;
 
-    // Actual row index in the matrix
-    unsigned int i  = levelRows[levelIdx];
     unsigned int nB = numCols;
 
-    // Initialize with RHS value B(i, b)
-    float sum  = B->values[i * nB + b];
+    if (numRows == 0) return;
 
-    // Diagonal entry L(i,i)
-    float diag = 1.0f;
+    // spread starting positions across blocks to reduce contention
+    unsigned int step      = (numRows + gridDim.x - 1) / gridDim.x;
+    unsigned int scanStart = (blockIdx.x * step) % numRows;
 
-    // Traverse nonzero elements of row i
-    for (unsigned int idx = L_r->rowPtrs[i];
-                      idx < L_r->rowPtrs[i + 1]; ++idx) {
+    while (true) {
 
-        unsigned int col = L_r->colIdxs[idx];
-        float        val = L_r->values[idx];
+        // only thread 0 searches for a row to process
+        if (threadIdx.x == 0) {
+            sharedRow = -1;
 
-        // Contributions from previously solved rows (earlier levels)
-        if (col < i) {
-            sum -= val * X->values[col * nB + b];
+            unsigned int pos = scanStart;
 
-        // Diagonal entry
-        } else if (col == i) {
-            diag = (val != 0.0f) ? val : 1.0f;
+            // scan for a ready row
+            for (unsigned int checked = 0; checked < numRows; ++checked) {
+
+                if (rowReady_v[pos] == 1) {
+
+                    // try to claim it
+                    int old = atomicCAS(&rowReady[pos], 1, 2);
+
+                    if (old == 1) {
+                        sharedRow  = (int)pos;
+                        scanStart  = (pos + 1) % numRows;
+                        break;
+                    }
+                }
+
+                if (++pos >= numRows) pos = 0;
+            }
+
+            // if nothing found, check if all rows are done
+            if (sharedRow == -1 &&
+                atomicAdd(completedRows, 0) >= (int)numRows) {
+                sharedRow = -2;
+            }
         }
-    }
 
-    // Solve for X(i,b)
-    X->values[i * nB + b] = sum / diag;
+        // broadcast result to all threads
+        __syncthreads();
+
+        if (sharedRow == -2) break;     // everything done
+        if (sharedRow == -1) continue;  // try again
+
+        unsigned int i = (unsigned int)sharedRow;
+
+        // compute X(i,b) in parallel over RHS columns
+        for (unsigned int b = threadIdx.x; b < nB; b += blockDim.x) {
+
+            float sum  = B->values[i * nB + b];
+            float diag = 1.0f;
+
+            // traverse row i
+            for (unsigned int idx = L_r->rowPtrs[i];
+                              idx < L_r->rowPtrs[i + 1]; ++idx) {
+
+                unsigned int col = L_r->colIdxs[idx];
+                float val = L_r->values[idx];
+
+                // dependency already resolved
+                if (col < i) {
+                    sum -= val * X->values[col * nB + b];
+                }
+                // diagonal
+                else if (col == i) {
+                    diag = (val != 0.0f) ? val : 1.0f;
+                }
+            }
+
+            X->values[i * nB + b] = sum / diag;
+        }
+
+        // make sure all threads finished writing X(i,*)
+        __syncthreads();
+
+        // thread 0 updates dependents
+        if (threadIdx.x == 0) {
+
+            // ensure writes to X are visible before releasing next rows
+            __threadfence();
+
+            for (unsigned int idx = dependentOffsets[i];
+                              idx < dependentOffsets[i + 1]; ++idx) {
+
+                unsigned int j = dependents[idx];
+
+                // decrease remaining dependency count
+                int rem = atomicSub(&depCounter[j], 1);
+
+                // if this was the last dependency, row becomes ready
+                if (rem == 1) {
+                    atomicExch(&rowReady[j], 1);
+                }
+            }
+
+            // mark row i as completed
+            atomicAdd(completedRows, 1);
+        }
+
+        __syncthreads();
+    }
 }
 
 
-// Host wrapper
 void sptrsv_gpu0_v2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
                     CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
 {
-    // Number of rows in the system
     unsigned int n = L_r_host->numRows;
 
-    // Step 1: Compute level of each row (dependency analysis)
-    // level[i] = depth of row i in dependency graph
-    // (the maximum number of sequential dependencies before i)
-    unsigned int* level = (unsigned int*)calloc(n, sizeof(unsigned int));
+    if (n == 0 || numCols == 0) return;
 
-    // Forward pass: since matrix is lower triangular,
-    // dependencies col < i are already processed
+    // count dependencies for each row
+    int* depCount_h = (int*)calloc(n, sizeof(int));
+    unsigned int* dependentCount_h = (unsigned int*)calloc(n, sizeof(unsigned int));
+
     for (unsigned int i = 0; i < n; ++i) {
         for (unsigned int idx = L_r_host->rowPtrs[i];
                           idx < L_r_host->rowPtrs[i + 1]; ++idx) {
@@ -89,89 +158,112 @@ void sptrsv_gpu0_v2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix*
             unsigned int col = L_r_host->colIdxs[idx];
 
             if (col < i) {
-                unsigned int candidate = level[col] + 1;
-                if (candidate > level[i]) level[i] = candidate;
+                depCount_h[i]++;
+                dependentCount_h[col]++;
             }
         }
     }
 
-    // Determine total number of levels
-    unsigned int numLevels = 0;
-    for (unsigned int i = 0; i < n; ++i) {
-        if (level[i] > numLevels) numLevels = level[i];
-    }
-    numLevels++; // levels are 0-indexed
+    // build prefix sum for dependents
+    unsigned int* dependentOffsets_h =
+        (unsigned int*)malloc((n + 1) * sizeof(unsigned int));
 
-    // Step 2: Count how many rows belong to each level
-    unsigned int* levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
-    for (unsigned int i = 0; i < n; ++i) {
-        levelCount[level[i]]++;
+    dependentOffsets_h[0] = 0;
+    for (unsigned int j = 0; j < n; ++j) {
+        dependentOffsets_h[j + 1] =
+            dependentOffsets_h[j] + dependentCount_h[j];
     }
 
-    // Step 3: Compute offsets for each level (prefix sum)
-    unsigned int* levelOffsets =
-        (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
+    unsigned int totalDeps = dependentOffsets_h[n];
 
-    levelOffsets[0] = 0;
-    for (unsigned int k = 0; k < numLevels; ++k) {
-        levelOffsets[k + 1] = levelOffsets[k] + levelCount[k];
-    }
+    // build dependents list
+    unsigned int* dependents_h =
+        (unsigned int*)malloc((totalDeps > 0 ? totalDeps : 1) * sizeof(unsigned int));
 
-    // Step 4: Build levelRows array (rows grouped by level)
-    unsigned int* levelRows = (unsigned int*)malloc(n * sizeof(unsigned int));
-    unsigned int* fillPos   = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
+    unsigned int* fillPos = (unsigned int*)calloc(n, sizeof(unsigned int));
 
     for (unsigned int i = 0; i < n; ++i) {
-        unsigned int k = level[i];
-        levelRows[levelOffsets[k] + fillPos[k]] = i;
-        fillPos[k]++;
+        for (unsigned int idx = L_r_host->rowPtrs[i];
+                          idx < L_r_host->rowPtrs[i + 1]; ++idx) {
+
+            unsigned int col = L_r_host->colIdxs[idx];
+
+            if (col < i) {
+                unsigned int pos = dependentOffsets_h[col] + fillPos[col];
+                dependents_h[pos] = i;
+                fillPos[col]++;
+            }
+        }
     }
 
-    // Step 5: Copy levelRows to GPU
-    unsigned int* levelRows_d;
-    CUDA_ERROR_CHECK(cudaMalloc((void**)&levelRows_d, n * sizeof(unsigned int)));
-
-    CUDA_ERROR_CHECK(cudaMemcpy(levelRows_d, levelRows, n * sizeof(unsigned int),
-                                cudaMemcpyHostToDevice));
-
-    // 2D thread block:
-    // - x: RHS columns
-    // - y: rows within level
-    const dim3 blockDim(16, 16);
-
-    // Step 6: Process each level sequentially
-    for (unsigned int k = 0; k < numLevels; ++k) {
-
-        unsigned int levelSize  = levelCount[k];
-        unsigned int levelStart = levelOffsets[k];
-
-        // Grid dimensions cover all (row, column) pairs in this level
-        dim3 gridDim(
-            (numCols   + blockDim.x - 1) / blockDim.x,
-            (levelSize + blockDim.y - 1) / blockDim.y
-        );
-
-        // Launch kernel for this level
-        sptrsv_gpu0_kernel_v2<<<gridDim, blockDim>>>(
-            L_r,
-            B,
-            X,
-            levelRows_d + levelStart,
-            levelSize,
-            numCols
-        );
-
-        // Ensure all rows in this level are completed before next level
-        CUDA_ERROR_CHECK(cudaGetLastError());
-        CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-    }
-
-    // Cleanup
-    CUDA_ERROR_CHECK(cudaFree(levelRows_d));
-
-    free(level);
-    free(levelCount);
-    free(levelOffsets);
-    free(levelRows);
     free(fillPos);
+    free(dependentCount_h);
+
+    // initialize ready rows
+    int* rowReady_h = (int*)calloc(n, sizeof(int));
+    for (unsigned int i = 0; i < n; ++i) {
+        if (depCount_h[i] == 0) rowReady_h[i] = 1;
+    }
+
+    // allocate GPU memory
+    int *depCounter_d, *rowReady_d, *completedRows_d;
+    unsigned int *dependents_d, *dependentOffsets_d;
+
+    CUDA_ERROR_CHECK(cudaMalloc(&depCounter_d, n * sizeof(int)));
+    CUDA_ERROR_CHECK(cudaMalloc(&rowReady_d, n * sizeof(int)));
+    CUDA_ERROR_CHECK(cudaMalloc(&dependents_d,
+                                (totalDeps > 0 ? totalDeps : 1) * sizeof(unsigned int)));
+    CUDA_ERROR_CHECK(cudaMalloc(&dependentOffsets_d,
+                                (n + 1) * sizeof(unsigned int)));
+    CUDA_ERROR_CHECK(cudaMalloc(&completedRows_d, sizeof(int)));
+
+    CUDA_ERROR_CHECK(cudaMemcpy(depCounter_d, depCount_h,
+                                n * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_ERROR_CHECK(cudaMemcpy(rowReady_d, rowReady_h,
+                                n * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_ERROR_CHECK(cudaMemcpy(dependents_d, dependents_h,
+                                (totalDeps > 0 ? totalDeps : 1) * sizeof(unsigned int),
+                                cudaMemcpyHostToDevice));
+    CUDA_ERROR_CHECK(cudaMemcpy(dependentOffsets_d, dependentOffsets_h,
+                                (n + 1) * sizeof(unsigned int),
+                                cudaMemcpyHostToDevice));
+    CUDA_ERROR_CHECK(cudaMemset(completedRows_d, 0, sizeof(int)));
+
+    // choose number of blocks based on number of SMs
+    int numSMs = 1;
+    CUDA_ERROR_CHECK(cudaDeviceGetAttribute(
+        &numSMs, cudaDevAttrMultiProcessorCount, 0));
+
+    const unsigned int blockSize = 128;
+
+    unsigned int gridSize = (unsigned int)(numSMs * 2);
+    if (gridSize > n) gridSize = n;
+    if (gridSize == 0) gridSize = 1;
+
+    // launch kernel
+    sptrsv_gpu0_kernel_v2<<<gridSize, blockSize>>>(
+        L_r, B, X,
+        depCounter_d,
+        rowReady_d,
+        dependents_d,
+        dependentOffsets_d,
+        n,
+        numCols,
+        completedRows_d
+    );
+
+    CUDA_ERROR_CHECK(cudaGetLastError());
+    CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+
+    // free everything
+    CUDA_ERROR_CHECK(cudaFree(depCounter_d));
+    CUDA_ERROR_CHECK(cudaFree(rowReady_d));
+    CUDA_ERROR_CHECK(cudaFree(dependents_d));
+    CUDA_ERROR_CHECK(cudaFree(dependentOffsets_d));
+    CUDA_ERROR_CHECK(cudaFree(completedRows_d));
+
+    free(depCount_h);
+    free(rowReady_h);
+    free(dependents_h);
+    free(dependentOffsets_h);
 }
