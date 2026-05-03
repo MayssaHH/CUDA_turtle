@@ -3,7 +3,7 @@
 #include <stdio.h>
 
 #define TILE_DIM_X 64
-#define TILE_DIM_Y 4
+#define TILE_DIM_Y 2
 
 // Threshold below which levels get batched into a single launch.
 // Wide levels (>= threshold) are launched individually as before.
@@ -173,7 +173,7 @@ void sptrsv_gpu2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     // These are uploaded to GPU once per batch at launch time.
 
     const dim3 blockDimWide(TILE_DIM_X, TILE_DIM_Y);
-    const unsigned int blockSizeThin = 128; // 1D block for thin kernel
+    const unsigned int blockSizeThin = 512; // 1D block for thin kernel
 
     cudaStream_t stream;
     CUDA_ERROR_CHECK(cudaStreamCreate(&stream));
