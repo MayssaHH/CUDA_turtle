@@ -165,6 +165,7 @@ void sptrsv_gpu2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         if (levelCount[k] < MERGE_THRESHOLD) thinCount++;
         else                                  wideCount++;
     }
+
     // ── Build batch descriptors on host ───────────────────────────────────
     // For each run of consecutive thin levels we build:
     //   batchRows[]    : concatenated row indices
@@ -262,8 +263,6 @@ void sptrsv_gpu2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     CUDA_ERROR_CHECK(cudaStreamSynchronize(stream));
     CUDA_ERROR_CHECK(cudaStreamDestroy(stream));
 
-    printf("[gpu2] totalLaunches=%u (was %u), reduction=%.1fx\n",
-           totalLaunches, numLevels, (float)numLevels / totalLaunches);
 
     CUDA_ERROR_CHECK(cudaFree(levelRows_d));
     free(level); free(levelCount); free(levelOffsets);
