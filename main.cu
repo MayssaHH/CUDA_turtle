@@ -25,27 +25,14 @@ void verify(DenseMatrix* result, DenseMatrix* reference) {
 }
 
 static const char* gpu_kernel_files[] = {
-    "kernel0_v1.cu",
     "kernel0.cu",
-    "kernel0_v2.cu",
     "kernel1.cu",
     "kernel2.cu",
     "kernel3.cu",
 };
 
-static const char* gpu_kernel_descriptions[] = {
-    "column-parallel forward substitution",
-    "level-set scheduling",
-    "dynamic dependency scheduling",
-    "level-set + shared-memory tiling",
-    "level-set + shared-memory tiling with stream-ordered sync",
-    "level-set + shared-memory tiling + 4-way register blocking",
-};
-
 void (*sptrsv_gpu[])(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols) = {
-    sptrsv_gpu0_v1,
     sptrsv_gpu0,
-    sptrsv_gpu0_v2,
     sptrsv_gpu1,
     sptrsv_gpu2,
     sptrsv_gpu3,
@@ -95,14 +82,6 @@ int main(int argc, char* argv[]) {
                 break;
             case '3':
                 runGPUVersion[3] = 1;
-                useGPU = 1;
-                break;
-            case '4':
-                runGPUVersion[4] = 1;
-                useGPU = 1;
-                break;
-            case '5':
-                runGPUVersion[5] = 1;
                 useGPU = 1;
                 break;
             default:
