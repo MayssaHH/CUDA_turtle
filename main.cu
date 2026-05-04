@@ -24,13 +24,6 @@ void verify(DenseMatrix* result, DenseMatrix* reference) {
     printf("        Verification succeeded\n");
 }
 
-static const char* gpu_kernel_files[] = {
-    "kernel0.cu",
-    "kernel1.cu",
-    "kernel2.cu",
-    "kernel3.cu",
-};
-
 void (*sptrsv_gpu[])(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols) = {
     sptrsv_gpu0,
     sptrsv_gpu1,
@@ -174,11 +167,8 @@ int main(int argc, char* argv[]) {
         for(unsigned int gpuVersion = 0; gpuVersion < 6; ++gpuVersion){
             if(runGPUVersion[gpuVersion]){
 
-                printf("Running GPU version %u (%s: %s)...\n",
-                       gpuVersion,
-                       gpu_kernel_files[gpuVersion],
-                       gpu_kernel_descriptions[gpuVersion]);
-
+		printf("Running GPU version %u...\n", gpuVersion);
+                
                 // Compute on GPU
                 Timer timer;
                 startTime(&timer);
@@ -206,7 +196,7 @@ int main(int argc, char* argv[]) {
                 sptrsv_gpu[gpuVersion](csc_d, csr_d, dense_d_256, result_d_256, csc_h, csr_h, dense_h_256->numCols);
                 CUDA_ERROR_CHECK(cudaDeviceSynchronize());
                 stopTime(&timer);
-                printElapsedTime(timer, "    GPU kernel time(256 cols)", GREEN);
+                printElapsedTime(timer, "    GPU kernel time(256 cols)", GREEN);    
 
                 // Copy data from GPU
                 copyDenseMatrixFromGPU(result_d_256, result_gpu_256);
@@ -220,7 +210,7 @@ int main(int argc, char* argv[]) {
                 result_d_256 = createEmptyDenseMatrixOnGPU(result_h_256->numRows, result_h_256->numCols);
                 copyCSRMatrixToGPU(csr_h, csr_d);
                 copyCSCMatrixToGPU(csc_h, csc_d);
-
+                
                 // Compute on GPU
                 startTime(&timer);
                 sptrsv_gpu[gpuVersion](csc_d, csr_d, dense_d_512, result_d_512, csc_h, csr_h, dense_h_512->numCols);
