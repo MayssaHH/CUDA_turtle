@@ -1,7 +1,7 @@
 
 NVCC        = nvcc
 NVCC_FLAGS  = -O3 -arch=sm_70 -std=c++11
-OBJ         = main.o matrix.o kernelCPU0.o kernel0_v1.o kernel0_v2.o kernel0.o kernel1.o kernel2.o kernel3.o
+OBJ         = main.o matrix.o kernelCPU0.o kernel0.o kernel1.o kernel2.o kernel3.o
 EXE         = sptrsv
 
 
