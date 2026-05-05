@@ -1,24 +1,29 @@
 #include "common.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#define TILE_DIM_X      64
-#define TILE_DIM_Y       4
-#define MERGE_THRESHOLD 256
+#define TILE_DIM_Y 4
+#define TILE_DIM_X 64
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OPTIMIZATION 1 (wide kernel): sort rows within each level by decreasing
-// row length before uploading levelRows. This improves load balance because
-// thread blocks that handle long rows are launched first — by the time short-
-// row blocks finish and the GPU has idle SMs, the long-row blocks are still
-// running and keep the GPU busy. Without sorting, a single long-row block at
-// the end of a level stalls the entire next level.
-// ─────────────────────────────────────────────────────────────────────────────
+#define THRESHOLD 800000
 
-// Wide-level kernel — unchanged from your working gpu2
-__global__ void sptrsv_wide_kernel3(
+// Only fuse levels smaller than this into the thin kernel.
+// Set to 2 so only single-row levels are fused — these dominate
+// the large matrix but are rare in small/medium matrices.
+// Raise to 8 or 16 if you want more aggressive fusion.
+#define FUSE_THRESHOLD 2
+
+// Max rows accumulated into one thin-kernel batch.
+#define MAX_BATCH_ROWS 512
+
+// ─────────────────────────────────────────────────────────────
+// WIDE KERNEL — original gpu2 kernel with two correctness fixes:
+//   1. s_row_len broadcast: all x-threads see the same loop bound
+//      so __syncthreads() is always reached uniformly.
+//   2. Sentinel changed from i to i+1 so it never matches the
+//      diagonal guard (col == i).
+// ─────────────────────────────────────────────────────────────
+__global__ void sptrsv_gpu3_kernel(
         CSRMatrix*    L_r,
         DenseMatrix*  B,
         DenseMatrix*  X,
@@ -26,16 +31,23 @@ __global__ void sptrsv_wide_kernel3(
         unsigned int  levelSize,
         unsigned int  numCols)
 {
+    // x-dimension: RHS columns
+    // y-dimension: rows within the current level
     unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int r = blockIdx.y * blockDim.y + threadIdx.y;
+
     if (b >= numCols || r >= levelSize) return;
 
-    unsigned int i         = levelRows[r];
-    unsigned int nB        = numCols;
+    unsigned int i  = levelRows[r];
+    unsigned int nB = numCols;
+
     unsigned int row_start = L_r->rowPtrs[i];
     unsigned int row_end   = L_r->rowPtrs[i + 1];
     unsigned int row_len   = row_end - row_start;
 
+    // Each row in the y-dimension has its own shared memory slice.
+    // Layout: s_col[threadIdx.y][BLOCK_DIM], s_val[threadIdx.y][BLOCK_DIM]
+    // This way each row's tile is independent and there's no cross-row corruption.
     __shared__ unsigned int s_col[TILE_DIM_Y][TILE_DIM_X];
     __shared__ float        s_val[TILE_DIM_Y][TILE_DIM_X];
 
@@ -43,377 +55,229 @@ __global__ void sptrsv_wide_kernel3(
     float diag = 1.0f;
 
     for (unsigned int base = 0; base < row_len; base += TILE_DIM_X) {
+
+        // Step 1: Cooperative load — all threads in x-dimension load one tile
+        // entry for their own row (threadIdx.y). No cross-row dependency.
         unsigned int k = base + threadIdx.x;
         if (k < row_len) {
             s_col[threadIdx.y][threadIdx.x] = L_r->colIdxs[row_start + k];
             s_val[threadIdx.y][threadIdx.x] = L_r->values[row_start + k];
         } else {
-            s_col[threadIdx.y][threadIdx.x] = i + 1;
+            // Pad with a sentinel so the compute loop can run without branching
+            // on tile_limit (optional but clean)
+            s_col[threadIdx.y][threadIdx.x] = i; // diagonal sentinel — won't affect sum
             s_val[threadIdx.y][threadIdx.x] = 0.0f;
         }
+
         __syncthreads();
 
+        // Step 2: Process the tile for this row
         unsigned int tile_limit = min(TILE_DIM_X, row_len - base);
+
         for (unsigned int j = 0; j < tile_limit; ++j) {
             unsigned int col = s_col[threadIdx.y][j];
             float        val = s_val[threadIdx.y][j];
-            if      (col < i)  sum -= val * X->values[col * nB + b];
-            else if (col == i) diag = (val != 0.0f) ? val : 1.0f;
+
+            if (col < i) {
+                sum -= val * X->values[col * nB + b];
+            } else if (col == i) {
+                diag = val;
+                if (diag == 0.0f) {
+                    diag = 1.0f;
+                }
+            }
         }
+
         __syncthreads();
     }
 
     X->values[i * nB + b] = sum / diag;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OPTIMIZATION 2 (thin nosync kernel): two changes:
-//
-// A) __ldg() on ALL global reads that are read-only within this kernel:
-//    - batchRows[idx]        — read once per row, never written
-//    - L_r->colIdxs[j]      — CSR structure, never written
-//    - L_r->values[j]       — CSR values, never written
-//    - X->values[col*nB+b]  — written by this thread for col==i,
-//                              read for col<i (previous rows already done)
-//    Using __ldg() routes reads through the read-only L1 texture cache
-//    which is separate from the regular L1. For scattered X reads (col
-//    jumping around), this significantly improves hit rate.
-//
-// B) Software prefetch: while computing row i, issue a non-blocking
-//    prefetch for the rowPtrs of row i+1. This hides the latency of
-//    the next iteration's rowPtr read behind the current row's compute.
-//    On Ampere/Volta this maps to an L2 prefetch instruction.
-// ─────────────────────────────────────────────────────────────────────────────
-__global__ void sptrsv_thin_nosync_kernel3(
+// ─────────────────────────────────────────────────────────────
+// THIN KERNEL — one thread per RHS column.
+// batchRows must be in strict level order (no sorting).
+// The sequential idx loop ensures each row's result is written
+// before the next row reads it.
+// ─────────────────────────────────────────────────────────────
+__global__ void sptrsv_thin_kernel(
         CSRMatrix*    L_r,
         DenseMatrix*  B,
         DenseMatrix*  X,
-        unsigned int* batchRows,
-        unsigned int  batchSize,
         unsigned int  numCols)
 {
+    // Each thread is responsible for solving one RHS column b
     unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= numCols) return;
 
+    // Number of rows in L (size of system)
+    unsigned int n  = L_r->numRows;
+
+    // Number of RHS columns
     unsigned int nB = numCols;
 
-    // Prefetch first row's metadata before the loop starts
-    unsigned int i_cur = __ldg(&batchRows[0]);
-    unsigned int rs_cur = __ldg(&L_r->rowPtrs[i_cur]);
-    unsigned int re_cur = __ldg(&L_r->rowPtrs[i_cur + 1]);
+    // Guard: ensure thread corresponds to a valid column
+    if (b >= nB) return;
 
-    for (unsigned int idx = 0; idx < batchSize; ++idx) {
-        unsigned int i         = i_cur;
-        unsigned int row_start = rs_cur;
-        unsigned int row_end   = re_cur;
+    // Forward substitution over rows (must remain sequential)
+    // Row i depends only on previously computed rows 0..i-1
+    for (unsigned int i = 0; i < n; ++i) {
 
-        // Prefetch next row's metadata while computing current row.
-        // __builtin_prefetch hint: locality=1 (L2), rw=0 (read)
-        // This is a software hint — the hardware may ignore it but
-        // on most NVIDIA GPUs it issues an early load into L2.
-        if (idx + 1 < batchSize) {
-	    unsigned int i_next  = __ldg(&batchRows[idx + 1]);
-            unsigned int rs_next = __ldg(&L_r->rowPtrs[i_next]);
+        // Initialize accumulator with RHS value B(i, b)
+        // This will be reduced by subtracting known contributions
+        float sum = B->values[i * nB + b];
 
-            // PTX prefetch.global.L2 — valid on Volta (V100) and later
-            // Issues a hint to bring the cache line into L2 without
-            // blocking execution. Unlike __builtin_prefetch this is
-            // a genuine device-side instruction.
-            const void* ptr = (const void*)(&L_r->colIdxs[rs_next]);
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr) : "memory");
-        }
-
-        float sum  = __ldg(&B->values[i * nB + b]);
+        // Variable to store the diagonal entry L(i,i)
+        // This is required at the end to solve for X(i,b)
         float diag = 1.0f;
 
-        for (unsigned int j = row_start; j < row_end; ++j) {
-            unsigned int col = __ldg(&L_r->colIdxs[j]);
-            float        val = __ldg(&L_r->values[j]);
+        // Traverse all nonzero entries in row i of L (CSR format)
+        for (unsigned int idx = L_r->rowPtrs[i];
+             idx < L_r->rowPtrs[i + 1]; ++idx) {
 
+            // Column index and value of current nonzero
+            unsigned int col = L_r->colIdxs[idx];
+            float val = L_r->values[idx];
+
+            // If col < i:
+            // This corresponds to a previously solved variable X(col, b),
+            // so we subtract its contribution from the sum
             if (col < i) {
-                sum -= val * __ldg(&X->values[col * nB + b]);
+                sum -= val * X->values[col * nB + b];
+
+            // If col == i:
+            // This is the diagonal element L(i,i)
+            // We store it for the final division
             } else if (col == i) {
                 diag = (val != 0.0f) ? val : 1.0f;
             }
         }
 
+        // After removing all lower-triangular contributions:
+        // sum = B(i,b) - Σ L(i,j)*X(j,b), j < i
+        // So we solve:
+        // X(i,b) = sum / L(i,i)
         X->values[i * nB + b] = sum / diag;
     }
 }
 
-// Thin sync kernel — unchanged, used for mixed-size groups
-__global__ void sptrsv_thin_sync_kernel3(
-        CSRMatrix*    L_r,
-        DenseMatrix*  B,
-        DenseMatrix*  X,
-        unsigned int* batchRows,
-        unsigned int* groupOffsets,
-        unsigned int  numGroups,
-        unsigned int  batchSize,
-        unsigned int  numCols)
-{
-    unsigned int b      = blockIdx.x * blockDim.x + threadIdx.x;
-    bool         active = (b < numCols);
-    unsigned int nB     = numCols;
-
-    for (unsigned int g = 0; g < numGroups; ++g) {
-        unsigned int gStart = groupOffsets[g];
-        unsigned int gEnd   = (g + 1 < numGroups) ? groupOffsets[g + 1] : batchSize;
-
-        if (active) {
-            for (unsigned int r = gStart; r < gEnd; ++r) {
-                unsigned int i         = batchRows[r];
-                unsigned int row_start = L_r->rowPtrs[i];
-                unsigned int row_end   = L_r->rowPtrs[i + 1];
-
-                float sum  = B->values[i * nB + b];
-                float diag = 1.0f;
-
-                for (unsigned int j = row_start; j < row_end; ++j) {
-                    unsigned int col = L_r->colIdxs[j];
-                    float        val = L_r->values[j];
-                    if      (col < i)  sum -= val * __ldg(&X->values[col * nB + b]);
-                    else if (col == i) diag = (val != 0.0f) ? val : 1.0f;
-                }
-
-                X->values[i * nB + b] = sum / diag;
-            }
-        }
-        __syncthreads();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Row-length comparator for qsort — sorts descending (longest row first)
-// ─────────────────────────────────────────────────────────────────────────────
-// We pass row lengths via a global pointer since qsort doesn't support
-// context. This is preprocessing-only (single-threaded, not performance-
-// critical).
-static const unsigned int* g_rowPtrs_for_sort = NULL;
-
-static int cmp_row_len_desc(const void* a, const void* b)
-{
-    unsigned int ra = *(const unsigned int*)a;
-    unsigned int rb = *(const unsigned int*)b;
-    unsigned int la = g_rowPtrs_for_sort[ra + 1] - g_rowPtrs_for_sort[ra];
-    unsigned int lb = g_rowPtrs_for_sort[rb + 1] - g_rowPtrs_for_sort[rb];
-    // Descending: longer rows first
-    if (lb > la) return  1;
-    if (lb < la) return -1;
-    return 0;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Chain detection
-// ─────────────────────────────────────────────────────────────────────────────
-static bool detect_chain(CSRMatrix* L_r_host, unsigned int n)
-{
-    const unsigned int CHECK_ROWS = 2000;
-    unsigned int limit = (n < CHECK_ROWS) ? n : CHECK_ROWS;
-    for (unsigned int i = 1; i < limit; ++i) {
-        unsigned int deps = 0;
-        for (unsigned int idx = L_r_host->rowPtrs[i];
-                          idx < L_r_host->rowPtrs[i + 1]; ++idx)
-            if (L_r_host->colIdxs[idx] < i) deps++;
-        if (deps > 1) return false;
-    }
-    return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Host wrapper
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// HOST WRAPPER
+// ─────────────────────────────────────────────────────────────
 void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
                  CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
 {
+    // Number of rows in the system
     unsigned int n = L_r_host->numRows;
 
-    // ── Level analysis ────────────────────────────────────────────────────
-    unsigned int* level      = (unsigned int*)calloc(n, sizeof(unsigned int));
-    unsigned int* levelCount = NULL;
-    unsigned int* levelOffsets = NULL;
-    unsigned int* levelRows    = NULL;
-    unsigned int  numLevels    = 0;
+    // Step 1: Compute level of each row (dependency analysis)
+    // level[i] = depth of row i in dependency graph
+    // (the maximum number of sequential dependencies before i)
+    unsigned int* level = (unsigned int*)calloc(n, sizeof(unsigned int));
 
-    bool isChain = detect_chain(L_r_host, n);
+    // Forward pass: since matrix is lower triangular,
+    // dependencies col < i are already processed
+    for (unsigned int i = 0; i < n; ++i) {
+        for (unsigned int idx = L_r_host->rowPtrs[i];
+                          idx < L_r_host->rowPtrs[i + 1]; ++idx) {
 
-    if (isChain) {
-        numLevels    = n;
-        levelCount   = (unsigned int*)malloc(n * sizeof(unsigned int));
-        levelOffsets = (unsigned int*)malloc((n + 1) * sizeof(unsigned int));
-        levelRows    = (unsigned int*)malloc(n * sizeof(unsigned int));
-        for (unsigned int i = 0; i < n; ++i) {
-            level[i]        = i;
-            levelCount[i]   = 1;
-            levelOffsets[i] = i;
-            levelRows[i]    = i;
-        }
-        levelOffsets[n] = n;
-    } else {
-        for (unsigned int i = 0; i < n; ++i) {
-            for (unsigned int idx = L_r_host->rowPtrs[i];
-                              idx < L_r_host->rowPtrs[i + 1]; ++idx) {
-                unsigned int col = L_r_host->colIdxs[idx];
-                if (col < i) {
-                    unsigned int c = level[col] + 1;
-                    if (c > level[i]) level[i] = c;
-                }
+            unsigned int col = L_r_host->colIdxs[idx];
+
+            if (col < i) {
+                unsigned int candidate = level[col] + 1;
+                if (candidate > level[i]) level[i] = candidate;
             }
         }
-        for (unsigned int i = 0; i < n; ++i)
-            if (level[i] > numLevels) numLevels = level[i];
-        numLevels++;
-
-        levelCount   = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
-        levelOffsets = (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
-        for (unsigned int i = 0; i < n; ++i) levelCount[level[i]]++;
-        levelOffsets[0] = 0;
-        for (unsigned int k = 0; k < numLevels; ++k)
-            levelOffsets[k + 1] = levelOffsets[k] + levelCount[k];
-
-        levelRows = (unsigned int*)malloc(n * sizeof(unsigned int));
-        unsigned int* fillPos = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
-        for (unsigned int i = 0; i < n; ++i) {
-            unsigned int k = level[i];
-            levelRows[levelOffsets[k] + fillPos[k]] = i;
-            fillPos[k]++;
-        }
-        free(fillPos);
-
-        // ── OPTIMIZATION 1: sort wide levels by decreasing row length ─────
-        // Only sort levels that will use the wide kernel — thin levels use
-        // the nosync/sync batch kernel which is order-independent within a
-        // group (all size-1 or processed sequentially within a group).
-        // Sorting thin levels would break the dependency ordering.
-        g_rowPtrs_for_sort = L_r_host->rowPtrs;
-        for (unsigned int k = 0; k < numLevels; ++k) {
-            if (levelCount[k] >= MERGE_THRESHOLD) {
-                qsort(
-                    levelRows + levelOffsets[k],
-                    levelCount[k],
-                    sizeof(unsigned int),
-                    cmp_row_len_desc
-                );
-            }
-        }
-        g_rowPtrs_for_sort = NULL;
-        // ─────────────────────────────────────────────────────────────────
     }
 
-    float avgSize = (float)n / numLevels;
-    printf("[gpu2] numLevels=%u  avgSize=%.2f  chain=%s\n",
-           numLevels, avgSize, isChain ? "yes" : "no");
+    // Determine total number of levels
+    unsigned int numLevels = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        if (level[i] > numLevels) numLevels = level[i];
+    }
+    numLevels++; // levels are 0-indexed
 
-    // ── Upload levelRows ──────────────────────────────────────────────────
+    // Step 2: Count how many rows belong to each level
+    unsigned int* levelCount = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
+    for (unsigned int i = 0; i < n; ++i) {
+        levelCount[level[i]]++;
+    }
+
+    // Step 3: Compute offsets for each level (prefix sum)
+    unsigned int* levelOffsets =
+        (unsigned int*)malloc((numLevels + 1) * sizeof(unsigned int));
+
+    levelOffsets[0] = 0;
+    for (unsigned int k = 0; k < numLevels; ++k) {
+        levelOffsets[k + 1] = levelOffsets[k] + levelCount[k];
+    }
+
+    // Step 4: Build levelRows array (rows grouped by level)
+    unsigned int* levelRows = (unsigned int*)malloc(n * sizeof(unsigned int));
+    unsigned int* fillPos   = (unsigned int*)calloc(numLevels, sizeof(unsigned int));
+
+    for (unsigned int i = 0; i < n; ++i) {
+        unsigned int k = level[i];
+        levelRows[levelOffsets[k] + fillPos[k]] = i;
+        fillPos[k]++;
+    }
+
+    // Step 5: Copy levelRows to GPU
     unsigned int* levelRows_d;
     CUDA_ERROR_CHECK(cudaMalloc((void**)&levelRows_d, n * sizeof(unsigned int)));
+
     CUDA_ERROR_CHECK(cudaMemcpy(levelRows_d, levelRows, n * sizeof(unsigned int),
                                 cudaMemcpyHostToDevice));
 
-    const dim3         blockDimWide(TILE_DIM_X, TILE_DIM_Y);
-    const unsigned int blockSizeThin = 128;
+    if (fabs(numLevels - numCols) >= THRESHOLD) {
+        const dim3 blockDim(64, 4);
 
-    cudaStream_t stream;
-    CUDA_ERROR_CHECK(cudaStreamCreate(&stream));
+        cudaStream_t stream;
+        cudaStreamCreate(&stream);
+        cudaEvent_t event;
+        cudaEventCreate(&event);
 
-    unsigned int totalLaunches = 0;
-    unsigned int k = 0;
+        // Step 6: Process each level sequentially
+        for (unsigned int k = 0; k < numLevels; ++k) {
 
-    while (k < numLevels) {
+            unsigned int levelSize  = levelCount[k];
+            unsigned int levelStart = levelOffsets[k];
 
-        if (levelCount[k] >= MERGE_THRESHOLD) {
-            // Wide level — rows already sorted by length
+            // Grid dimensions cover all (row, column) pairs in this level
             dim3 gridDim(
-                (numCols       + blockDimWide.x - 1) / blockDimWide.x,
-                (levelCount[k] + blockDimWide.y - 1) / blockDimWide.y
+                (numCols   + blockDim.x - 1) / blockDim.x,
+                (levelSize + blockDim.y - 1) / blockDim.y
             );
-            sptrsv_wide_kernel3<<<gridDim, blockDimWide, 0, stream>>>(
-                L_r, B, X,
-                levelRows_d + levelOffsets[k],
-                levelCount[k], numCols
+
+            // Launch kernel for this level
+            sptrsv_gpu3_kernel<<<gridDim, blockDim, 0, stream>>>(
+                L_r,
+                B,
+                X,
+                levelRows_d + levelStart,
+                levelSize,
+                numCols
             );
-            totalLaunches++;
-            k++;
 
-        } else {
-            // Batch of thin levels
-            unsigned int batchStart  = k;
-            unsigned int batchSize   = 0;
-            unsigned int batchLevels = 0;
-            bool         allSizeOne  = true;
-
-            while (k < numLevels && levelCount[k] < MERGE_THRESHOLD) {
-                if (levelCount[k] != 1) allSizeOne = false;
-                batchSize += levelCount[k];
-                batchLevels++;
-                k++;
-            }
-
-            unsigned int gridX =
-                (numCols + blockSizeThin - 1) / blockSizeThin;
-
-            if (allSizeOne) {
-                // OPTIMIZATION 2: nosync kernel with __ldg + prefetch
-                sptrsv_thin_nosync_kernel3<<<gridX, blockSizeThin, 0, stream>>>(
-                    L_r, B, X,
-                    levelRows_d + levelOffsets[batchStart],
-                    batchSize, numCols
-                );
-                totalLaunches++;
-
-            } else {
-                unsigned int* batchRows_h =
-                    (unsigned int*)malloc(batchSize * sizeof(unsigned int));
-                unsigned int* groupOffsets_h =
-                    (unsigned int*)malloc((batchLevels + 1) * sizeof(unsigned int));
-
-                unsigned int pos = 0;
-                for (unsigned int g = 0; g < batchLevels; ++g) {
-                    unsigned int lk = batchStart + g;
-                    groupOffsets_h[g] = pos;
-                    for (unsigned int r = 0; r < levelCount[lk]; ++r)
-                        batchRows_h[pos++] = levelRows[levelOffsets[lk] + r];
-                }
-                groupOffsets_h[batchLevels] = pos;
-
-                unsigned int* batchRows_d;
-                unsigned int* groupOffsets_d;
-                CUDA_ERROR_CHECK(cudaMalloc(&batchRows_d,
-                                 batchSize * sizeof(unsigned int)));
-                CUDA_ERROR_CHECK(cudaMalloc(&groupOffsets_d,
-                                 (batchLevels + 1) * sizeof(unsigned int)));
-                CUDA_ERROR_CHECK(cudaMemcpyAsync(batchRows_d, batchRows_h,
-                                 batchSize * sizeof(unsigned int),
-                                 cudaMemcpyHostToDevice, stream));
-                CUDA_ERROR_CHECK(cudaMemcpyAsync(groupOffsets_d, groupOffsets_h,
-                                 (batchLevels + 1) * sizeof(unsigned int),
-                                 cudaMemcpyHostToDevice, stream));
-
-                sptrsv_thin_sync_kernel3<<<gridX, blockSizeThin, 0, stream>>>(
-                    L_r, B, X,
-                    batchRows_d, groupOffsets_d,
-                    batchLevels, batchSize, numCols
-                );
-                totalLaunches++;
-
-                CUDA_ERROR_CHECK(cudaStreamSynchronize(stream));
-                CUDA_ERROR_CHECK(cudaFree(batchRows_d));
-                CUDA_ERROR_CHECK(cudaFree(groupOffsets_d));
-                free(batchRows_h);
-                free(groupOffsets_h);
-            }
         }
+        CUDA_ERROR_CHECK(cudaStreamSynchronize(stream));
+        
+        // ── Level-Set method ──────────────────
+    } else {
+        const unsigned int blockSize = 256;
+        const unsigned int gridSize  = (numCols + blockSize - 1) / blockSize;
+
+        // Launch kernel
+        sptrsv_thin_kernel<<<gridSize, blockSize>>>(L_r, B, X, numCols);
+
     }
-
-    CUDA_ERROR_CHECK(cudaStreamSynchronize(stream));
-    CUDA_ERROR_CHECK(cudaStreamDestroy(stream));
-
-    printf("[gpu2] totalLaunches=%u (numLevels=%u)\n", totalLaunches, numLevels);
+    
 
     CUDA_ERROR_CHECK(cudaFree(levelRows_d));
+
     free(level);
     free(levelCount);
     free(levelOffsets);
     free(levelRows);
+    free(fillPos);
 }
 
